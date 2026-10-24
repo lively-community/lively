@@ -812,6 +812,11 @@ namespace Lively.Player.WebView2
         /// path is synthesizing the wheel event inside the page. The script also emulates
         /// the browser default action (scrolling the nearest scrollable ancestor) for
         /// events the page itself does not consume.
+        /// Sign: the raw delta arrives in WM_MOUSEWHEEL convention (positive = roll
+        /// forward = scroll up) while DOM deltaY/scrollTop/scrollBy use positive =
+        /// scroll down; vertical is negated here so wheel/touchpad behave like every
+        /// normal window (2026-10-24: missing flip inverted the whole wallpaper).
+        /// Horizontal already matches (WM_MOUSEHWHEEL positive = right = DOM deltaX).
         /// </summary>
         private async Task ForwardWheelToPage(LivelyWheelCmd cmd)
         {
@@ -830,7 +835,7 @@ namespace Lively.Player.WebView2
                 "var n=el;while(n&&n!==document.body){var st=getComputedStyle(n);" +
                 "if(/(auto|scroll)/.test(st.overflowY)&&n.scrollHeight>n.clientHeight){n.scrollTop+=d;return;}" +
                 "if(/(auto|scroll)/.test(st.overflowX)&&n.scrollWidth>n.clientWidth){n.scrollLeft+=dx;return;}" +
-                "n=n.parentElement;}window.scrollBy(dx||0,d||0);})(" + x + "," + y + "," + cmd.Delta + "," + cmd.DeltaX + ")";
+                "n=n.parentElement;}window.scrollBy(dx||0,d||0);})(" + x + "," + y + "," + (-cmd.Delta) + "," + cmd.DeltaX + ")";
             await webView.CoreWebView2.ExecuteScriptAsync(script);
         }
 

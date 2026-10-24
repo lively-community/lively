@@ -491,9 +491,12 @@ namespace Lively.Views.WindowMsg
 
                 var avgDy = (dy0 + dy1) / 2.0;
 
-                // PTP Y grows downward; a two-finger swipe down must scroll content down,
-                // which is a negative legacy wheel delta.
-                var wheel = -(int)Math.Round(avgDy * TravelToWheelFactor);
+                // 2026-10-25 sign fix: this pad's raw PTP contact Y actually grows upward,
+                // so a two-finger swipe down yields negative avgDy; without negation the
+                // emitted wheel matches a physical wheel (backward roll = negative delta)
+                // and the single DOM-convention flip in ForwardWheelToPage governs both
+                // devices the same way. The old negation double-flipped touchpad vs mouse.
+                var wheel = (int)Math.Round(avgDy * TravelToWheelFactor);
 
                 if (Math.Abs(avgDy) < MinTravelUnits || wheel == 0)
                 {
