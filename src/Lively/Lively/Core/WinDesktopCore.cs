@@ -1,4 +1,4 @@
-﻿using Lively.Common;
+using Lively.Common;
 using Lively.Common.Com;
 using Lively.Common.Exceptions;
 using Lively.Common.Extensions;
@@ -9,6 +9,7 @@ using Lively.Common.Helpers.Shell;
 using Lively.Common.Services;
 using Lively.Core.Display;
 using Lively.Core.Suspend;
+using Lively.Core.Wallpapers;
 using Lively.Core.Watchdog;
 using Lively.Extensions;
 using Lively.Factories;
@@ -112,11 +113,31 @@ namespace Lively.Core
             this.rawInput.MouseMoveRaw += RawInput_MouseMoveRaw;
             this.rawInput.MouseDownRaw += RawInput_MouseDownRaw;
             this.rawInput.MouseUpRaw += RawInput_MouseUpRaw;
+            this.rawInput.MouseWheelRaw += RawInput_MouseWheelRaw;
             this.rawInput.KeyboardClickRaw += RawInput_KeyboardClickRaw;
             this.screensaverIdleTimer.Elapsed += ScreensaverIdleTimer_Elapsed;
 
             // Initialize desktop and update handles.
             SetupDesktopLayer();
+
+            // Some startup races leave the raw input sink deaf until a re-register;
+            // heal once shortly after boot so wheel forwarding survives bad starts.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(15));
+                    this.rawInput.Dispatcher.Invoke(() =>
+                    {
+                        this.rawInput.ReRegisterRawInputDevices();
+                        Logger.Info("Raw input devices re-registered (startup heal).");
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error(ex);
+                }
+            });
 
             try
             {
@@ -1128,6 +1149,43 @@ namespace Lively.Core
         {
             if (e.Reason == SessionSwitchReason.SessionUnlock)
             {
+                // Raw input delivery can silently die across a lock/unlock cycle;
+                // re-register so input forwarding keeps working without an app restart.
+                try
+                {
+                    // SessionSwitch arrives on a non-UI thread; the WPF window
+                    // (and its hwnd) must be touched from the dispatcher only.
+                    System.Windows.Application.Current?.Dispatcher?.Invoke(() =>
+                    {
+                        this.rawInput.ReRegisterRawInputDevices();
+                        Logger.Info("Raw input devices re-registered after unlock.");
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error(ex);
+                }
+
+                // The unlock-time re-registration races with the desktop stack
+                // still restoring; schedule one more pass a few seconds later
+                // as a safety net (fire-and-forget, does not block wallpaper restore).
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(3000);
+                    try
+                    {
+                        System.Windows.Application.Current?.Dispatcher?.Invoke(() =>
+                        {
+                            this.rawInput.ReRegisterRawInputDevices();
+                            Logger.Info("Raw input devices re-registered (unlock second pass).");
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Error(ex);
+                    }
+                });
+
                 if (userSettings.Settings.IsRestartAfterLockscreen)
                 {
                     Logger.Info("Desktop unlocked, resetting wallpaper service.");
@@ -1220,6 +1278,89 @@ namespace Lively.Core
             }
         }
 
+        private long lastWheelFwdLog;
+        private long lastWheelWpLog;
+
+        private static bool IsCursorOverWindow(IntPtr hwnd, int x, int y)
+        {
+            var hit = NativeMethods.WindowFromPoint(new NativeMethods.POINT { X = x, Y = y });
+            if (hit == IntPtr.Zero)
+                return false;
+            // Both resolve to the same top-level window (the WorkerW chain) when the
+            // cursor actually hovers the wallpaper; any covering app window breaks the match.
+            return NativeMethods.GetAncestor(hit, NativeMethods.GetAncestorFlags.GetRoot) ==
+                NativeMethods.GetAncestor(hwnd, NativeMethods.GetAncestorFlags.GetRoot);
+        }
+
+        private void RawInput_MouseWheelRaw(object sender, MouseWheelRawArgs e)
+        {
+            if (userSettings.Settings.InputForward == InputForwardMode.off)
+                return;
+
+            try
+            {
+                // Detect active wallpaper based on cursor.
+                var display = displayManager.GetDisplayMonitorFromPoint(new System.Drawing.Point(e.X, e.Y));
+                if (Environment.TickCount64 - lastWheelFwdLog > 1000)
+                {
+                    lastWheelFwdLog = Environment.TickCount64;
+                    Logger.Info($"Wheel raw: ({e.X},{e.Y}) d={e.Delta} fgDesktop={IsDesktop()} disp={display?.DeviceId} nWp={Wallpapers.Count}");
+                }
+                foreach (var wallpaper in Wallpapers)
+                {
+                    var allowed = wallpaper.Category.IsDeviceInputAllowed();
+                    var dispEq = display.Equals(wallpaper.Screen) || userSettings.Settings.WallpaperArrangement == WallpaperArrangement.span;
+                    if (Environment.TickCount64 - lastWheelWpLog > 1000)
+                    {
+                        lastWheelWpLog = Environment.TickCount64;
+                        Logger.Info($"Wheel wp: allowed={allowed} dispEq={dispEq} cat={wallpaper.Category} screen={wallpaper.Screen?.DeviceId} hwnd={wallpaper.InputHandle}");
+                    }
+                    if (!allowed || !dispEq)
+                        continue;
+                    // Unlike clicks, hovering does not give the desktop foreground focus,
+                    // so requiring IsDesktop() alone would break hover-scrolling entirely.
+                    // Forward when the desktop is focused OR the cursor truly hovers this wallpaper.
+                    var overWallpaper = IsCursorOverWindow(wallpaper.InputHandle, e.X, e.Y);
+                    if (Environment.TickCount64 - lastWheelFwdLog > 1000)
+                    {
+                        lastWheelFwdLog = Environment.TickCount64;
+                        Logger.Info($"Wheel fwd check: overWp={overWallpaper}");
+                    }
+                    if (!IsDesktop() && !overWallpaper)
+                        continue;
+                    // WM_MOUSEWHEEL lParam is in screen coordinates; raw cursor pos is passed as-is.
+                    // WebView2 (Chromium) drops posted wheel messages, so deliver through player IPC + CDP instead.
+                    // NB: the OS only synthesizes legacy queue wheel when the foreground is an app (not the
+                    // desktop); the player-side thread hook covers the rare window-aimed delivery as backup.
+                    if (wallpaper is WebWebView2 webWallpaper)
+                        webWallpaper.SendMessage(new LivelyWheelCmd
+                        {
+                            X = e.X,
+                            Y = e.Y,
+                            Delta = e.Horizontal ? 0 : e.Delta,
+                            DeltaX = e.Horizontal ? e.Delta : 0,
+                        });
+                    else
+                        InputUtil.MouseWheel(wallpaper.InputHandle, e.X, e.Y, e.Delta);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error(ex);
+            }
+        }
+
+        // 前台线程当前持有键盘焦点的窗口（壁纸 WebView2 输入法模式时 = 壁纸浏览器子窗口）
+        private static IntPtr ForegroundFocusHwnd()
+        {
+            var fg = NativeMethods.GetForegroundWindow();
+            if (fg == IntPtr.Zero)
+                return IntPtr.Zero;
+            var tid = NativeMethods.GetWindowThreadProcessId(fg, out _);
+            var info = new NativeMethods.GUITHREADINFO { cbSize = System.Runtime.InteropServices.Marshal.SizeOf<NativeMethods.GUITHREADINFO>() };
+            return NativeMethods.GetGUIThreadInfo(tid, ref info) ? info.hwndFocus : IntPtr.Zero;
+        }
+
         private void RawInput_KeyboardClickRaw(object sender, KeyboardClickRawArgs e)
         {
             try
@@ -1232,12 +1373,18 @@ namespace Lively.Core
                 if (!NativeMethods.GetCursorPos(out NativeMethods.POINT P))
                     return;
 
+                // 壁纸 WebView2 已持有真实键盘焦点（star-map 输入法模式）时：
+                // 系统 WM_KEYDOWN 直接投递给它，再转发一份会造成双字符。
+                var focus = ForegroundFocusHwnd();
                 var display = displayManager.GetDisplayMonitorFromPoint(new System.Drawing.Point(P.X, P.Y));
                 foreach (var wallpaper in Wallpapers)
                 {
                     if (wallpaper.Category.IsDeviceInputAllowed() &&
                         (display.Equals(wallpaper.Screen) || userSettings.Settings.WallpaperArrangement == WallpaperArrangement.span))
                     {
+                        if (focus != IntPtr.Zero &&
+                            (focus == wallpaper.InputHandle || NativeMethods.IsChild(wallpaper.InputHandle, focus)))
+                            continue;
                         InputUtil.ForwardMessageKeyboard(wallpaper.InputHandle, e.WindowMessage, e.VirtualKey, e.ScanCode, e.IsKeyDown);
                     }
                 }

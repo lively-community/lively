@@ -23,6 +23,7 @@ namespace Lively.Common.JsonConverters
                 MessageType.cmd_suspend => jo.ToObject<LivelySuspendCmd>(serializer),
                 MessageType.cmd_resume => jo.ToObject<LivelyResumeCmd>(serializer),
                 MessageType.cmd_volume => jo.ToObject<LivelyVolumeCmd>(serializer),
+                MessageType.cmd_wheel => jo.ToObject<LivelyWheelCmd>(serializer),
                 MessageType.lsp_perfcntr => jo.ToObject<LivelySystemInformation>(serializer),
                 MessageType.lsp_nowplaying => jo.ToObject<LivelySystemNowPlaying>(serializer),
                 MessageType.lp_slider => jo.ToObject<LivelySlider>(serializer),

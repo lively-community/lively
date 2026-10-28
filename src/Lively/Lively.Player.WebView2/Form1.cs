@@ -10,12 +10,14 @@ using Lively.Models.Message;
 using Lively.Player.WebView2.Extensions.WebView2;
 using Microsoft.Web.WebView2.Core;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -35,6 +37,101 @@ namespace Lively.Player.WebView2
         private IAudioVisualizerService visualizerService;
         private IHardwareUsageService hardwareUsageService;
         private INowPlayingService nowPlayingService;
+
+        // ------------------------------------------------------------------
+        // Touchpad wheel delivery (Win11 precision touchpad): two-finger scroll
+        // is synthesized by the OS as classic WM_MOUSEWHEEL with fine-grained
+        // deltas and delivered straight to the window under the cursor, without
+        // entering the raw input queue (the main app's raw-input listener never
+        // sees it) - and WebView2 drops wheel messages outright. A thread-local
+        // WH_GETMESSAGE hook observes every message retrieved on this UI thread
+        // for the whole window chain (this form + WebView2's Chrome children),
+        // so wheel is intercepted here and synthesized inside the page instead.
+        // ------------------------------------------------------------------
+        private const int WH_GETMESSAGE = 3;
+        private const uint WM_NULL = 0x0000;
+        private const uint WM_MOUSEWHEEL = 0x020A;
+        private const uint WM_MOUSEHWHEEL = 0x020E;
+        private const uint WM_POINTERWHEEL = 0x020F;
+        private const uint WM_POINTERHWHEEL = 0x0210;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MSGINFO
+        {
+            public IntPtr hwnd;
+            public uint message;
+            public IntPtr wParam;
+            public IntPtr lParam;
+            public uint time;
+            public int ptX;
+            public int ptY;
+        }
+
+        private delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")] private static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
+        [DllImport("user32.dll")] private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+        [DllImport("user32.dll")] private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+        [DllImport("kernel32.dll")] private static extern IntPtr GetModuleHandle(string moduleName);
+        [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
+        [DllImport("user32.dll")] private static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
+
+        private IntPtr wheelHook;
+        private HookProc wheelHookProc; // rooted to prevent GC while installed
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            wheelHookProc = WheelMsgHookProc;
+            wheelHook = SetWindowsHookEx(WH_GETMESSAGE, wheelHookProc,
+                GetModuleHandle(null), GetCurrentThreadId());
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            if (wheelHook != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(wheelHook);
+                wheelHook = IntPtr.Zero;
+            }
+            base.OnHandleDestroyed(e);
+        }
+
+        private IntPtr WheelMsgHookProc(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            // HC_ACTION (0) with nonzero wParam: the message is being removed;
+            // peek-only passes (wParam == 0) are skipped to avoid double handling.
+            if (nCode == 0 && wParam != IntPtr.Zero && lParam != IntPtr.Zero && !IsDisposed)
+            {
+                var m = (MSGINFO)Marshal.PtrToStructure(lParam, typeof(MSGINFO));
+                var isWheel = m.message == WM_MOUSEWHEEL || m.message == WM_MOUSEHWHEEL
+                    || m.message == WM_POINTERWHEEL || m.message == WM_POINTERHWHEEL;
+                // GA_ROOT (2): only messages aimed at this form's window chain;
+                // the WebView2 Chrome children resolve to this form as root.
+                if (isWheel && GetAncestor(m.hwnd, 2) == Handle)
+                {
+                    var horizontal = m.message == WM_MOUSEHWHEEL || m.message == WM_POINTERHWHEEL;
+                    var delta = (short)((long)m.wParam >> 16);
+                    // Pointer-wheel deltas can carry huge flick values; clamp so a
+                    // single event cannot jump the page by whole screens.
+                    if (delta > 400) delta = 400;
+                    if (delta < -400) delta = -400;
+                    var x = (short)((long)m.lParam & 0xFFFF);
+                    var y = (short)(((long)m.lParam >> 16) & 0xFFFF);
+                    _ = ForwardWheelToPage(new LivelyWheelCmd
+                    {
+                        X = x,
+                        Y = y,
+                        Delta = horizontal ? 0 : delta,
+                        DeltaX = horizontal ? delta : 0,
+                    });
+                    // WebView2 drops these anyway; rewrite to WM_NULL so the page
+                    // can never receive a double delivery if Chromium changes.
+                    Marshal.WriteInt32(lParam, 8, (int)WM_NULL);
+                }
+            }
+            return CallNextHookEx(wheelHook, nCode, wParam, lParam);
+        }
 
         private bool IsDebugging { get; } = BuildInfoUtil.IsDebugBuild();
 
@@ -199,6 +296,7 @@ namespace Lively.Player.WebView2
             webView.CoreWebView2.NewWindowRequested += CoreWebView2_NewWindowRequested;
             webView.CoreWebView2.DownloadStarting += CoreWebView2_DownloadStarting;
             webView.CoreWebView2.DocumentTitleChanged += CoreWebView2_DocumentTitleChanged;
+            webView.CoreWebView2.WebMessageReceived += CoreWebView2_WebMessageReceived;
 
             switch (startArgs.Type)
             {
@@ -263,6 +361,132 @@ namespace Lively.Player.WebView2
         private void CoreWebView2_DocumentTitleChanged(object sender, object e)
         {
             this.Invoke((MethodInvoker)(() => this.Text = webView.CoreWebView2.DocumentTitle));
+        }
+
+        // —— 壁纸输入法支持（star-map 页触发）——
+        // 页面 input 聚焦时 postMessage({"type":"star-input-focus",x,y,w,h})（设备像素，相对壁纸客户区）：
+        // 播放器在输入框正上方浮一个原生无边框小窗 + TextBox。原生顶层窗口能拿真实前台，
+        // 系统 IME（中文输入法）随之挂上——彻底绕开"桌面持前台、壁纸子窗口抢焦点"的抖动战争
+        // （旧方案的 SetFocus 抢焦点会被系统反复抢回，焦点抖动=页面提示反复弹、IME 挂不稳）。
+        // Enter=提交（ExecuteScriptAsync 回填页面并检索）；Esc/点到别处=关闭并通知页面失焦。
+        // 原生框持前台期间主程序键盘转发自动停（IsDesktop()=false），无双字符。
+        [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+        [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        private NativeInputBox nativeInput;
+
+        // 原生输入小窗：1px 亮边 + 深底文本框，视觉贴近星图查询框
+        private class NativeInputBox : Form
+        {
+            public TextBox Box;
+            public NativeInputBox()
+            {
+                FormBorderStyle = FormBorderStyle.None;
+                ShowInTaskbar = false;
+                TopMost = true;
+                StartPosition = FormStartPosition.Manual;
+                BackColor = Color.FromArgb(62, 66, 70);          // 充当 1px 边框
+                Padding = new Padding(1);
+                var panel = new Panel { Dock = DockStyle.Fill, BackColor = Color.FromArgb(16, 17, 18), Padding = new Padding(9, 7, 9, 6) };
+                Box = new TextBox
+                {
+                    Dock = DockStyle.Fill,
+                    BackColor = Color.FromArgb(16, 17, 18),
+                    ForeColor = Color.FromArgb(232, 231, 226),
+                    BorderStyle = BorderStyle.None,
+                    Font = new Font("Microsoft YaHei UI", 10.5f)
+                };
+                panel.Controls.Add(Box);
+                Controls.Add(panel);
+            }
+        }
+
+        private void ShowNativeInput(int x, int y, int w, int h)
+        {
+            if (nativeInput == null)
+            {
+                nativeInput = new NativeInputBox();
+                nativeInput.Box.KeyDown += (s, ev) =>
+                {
+                    if (ev.KeyCode == Keys.Enter)
+                    {
+                        ev.SuppressKeyPress = true;
+                        var text = nativeInput.Box.Text;
+                        HideNativeInput(false);
+                        RunPageScript($"window.__starNativeSubmit && window.__starNativeSubmit({JsonConvert.SerializeObject(text)})");
+                    }
+                    else if (ev.KeyCode == Keys.Escape)
+                    {
+                        ev.SuppressKeyPress = true;
+                        HideNativeInput(true);
+                    }
+                };
+                nativeInput.Deactivate += (s, ev) => nativeInput.BeginInvoke((MethodInvoker)(() => HideNativeInput(true)));
+            }
+            nativeInput.Bounds = new Rectangle(this.PointToScreen(new Point(x, y)), new Size(Math.Max(w, 220), Math.Max(h, 26) + 16));
+            nativeInput.Box.Text = string.Empty;
+            nativeInput.Show(this);
+            // 后台进程直接 SetForegroundWindow 会被系统拒绝：挂上前台线程的输入队列再顶前台（经典手法）
+            var fg = NativeMethods.GetForegroundWindow();
+            var fgTid = GetWindowThreadProcessId(fg, out _);
+            var myTid = GetCurrentThreadId();
+            if (fgTid != myTid) AttachThreadInput(fgTid, myTid, true);
+            NativeMethods.SetForegroundWindow(nativeInput.Handle);
+            if (fgTid != myTid) AttachThreadInput(fgTid, myTid, false);
+            nativeInput.Activate();
+            nativeInput.Box.Focus();
+        }
+
+        private void HideNativeInput(bool notifyBlur)
+        {
+            if (nativeInput == null || !nativeInput.Visible)
+                return;
+            nativeInput.Visible = false;   // 先置不可见再 Hide：Hide 触发的 Deactivate 会二次进来，靠此旗标短路
+            nativeInput.Hide();
+            if (notifyBlur)
+                RunPageScript("window.__starNativeBlur && window.__starNativeBlur()");
+        }
+
+        private async void RunPageScript(string script)
+        {
+            try
+            {
+                if (webView?.CoreWebView2 != null)
+                    await webView.CoreWebView2.ExecuteScriptAsync(script);
+            }
+            catch { }
+        }
+
+        private void CoreWebView2_WebMessageReceived(object sender, CoreWebView2WebMessageReceivedEventArgs e)
+        {
+            try
+            {
+                var msg = (e.TryGetWebMessageAsString() ?? string.Empty).Trim();
+                if (msg.StartsWith("star-input-focus"))
+                {
+                    int x = 40, y = 40, w = 460, h = 34;   // 无坐标时的兜底位
+                    try
+                    {
+                        if (msg.StartsWith("{"))
+                        {
+                            var j = JObject.Parse(msg);
+                            x = (int)j["x"]; y = (int)j["y"]; w = (int)j["w"]; h = (int)j["h"];
+                        }
+                    }
+                    catch { }
+                    "star-input-focus: native ime box".SendLog(SendToParent);
+                    BeginInvoke((MethodInvoker)(() =>
+                    {
+                        try { ShowNativeInput(x, y, w, h); }
+                        catch (Exception ex) { ex.SendError(SendToParent, "native input failed"); }
+                    }));
+                }
+                else if (msg == "star-input-blur")
+                {
+                    BeginInvoke((MethodInvoker)(() => HideNativeInput(false)));
+                }
+            }
+            catch { }
         }
 
         private void CoreWebView2_ProcessFailed(object sender, CoreWebView2ProcessFailedEventArgs e)
@@ -513,6 +737,9 @@ namespace Lively.Player.WebView2
                     var vc = (LivelyVolumeCmd)obj;
                     webView.CoreWebView2.IsMuted = vc.Volume == 0;
                     break;
+                case MessageType.cmd_wheel:
+                    await ForwardWheelToPage((LivelyWheelCmd)obj);
+                    break;
                 case MessageType.cmd_screenshot:
                     var success = true;
                     var scr = (LivelyScreenshotCmd)obj;
@@ -577,6 +804,39 @@ namespace Lively.Player.WebView2
                     // Handle on caller
                     break;
             }
+        }
+
+        /// <summary>
+        /// WebView2 (Chromium) silently drops WM_MOUSEWHEEL posted to its windows, and
+        /// CDP Input.dispatchMouseEvent never completes in WebView2; the only reliable
+        /// path is synthesizing the wheel event inside the page. The script also emulates
+        /// the browser default action (scrolling the nearest scrollable ancestor) for
+        /// events the page itself does not consume.
+        /// Sign: the raw delta arrives in WM_MOUSEWHEEL convention (positive = roll
+        /// forward = scroll up) while DOM deltaY/scrollTop/scrollBy use positive =
+        /// scroll down; vertical is negated here so wheel/touchpad behave like every
+        /// normal window (2026-10-24: missing flip inverted the whole wallpaper).
+        /// Horizontal already matches (WM_MOUSEHWHEEL positive = right = DOM deltaX).
+        /// </summary>
+        private async Task ForwardWheelToPage(LivelyWheelCmd cmd)
+        {
+            if (isPaused || webView?.CoreWebView2 == null)
+                return;
+
+            // Physical screen point -> CSS viewport point.
+            var origin = webView.PointToScreen(Point.Empty);
+            var scale = 96f / webView.DeviceDpi;
+            var x = (int)((cmd.X - origin.X) * scale);
+            var y = (int)((cmd.Y - origin.Y) * scale);
+            var script =
+                "(function(x,y,d,dx){var el=document.elementFromPoint(x,y)||document.body;" +
+                "var ev=new WheelEvent('wheel',{bubbles:true,cancelable:true,clientX:x,clientY:y,deltaX:dx||0,deltaY:d||0});" +
+                "if(!el.dispatchEvent(ev))return;" +
+                "var n=el;while(n&&n!==document.body){var st=getComputedStyle(n);" +
+                "if(/(auto|scroll)/.test(st.overflowY)&&n.scrollHeight>n.clientHeight){n.scrollTop+=d;return;}" +
+                "if(/(auto|scroll)/.test(st.overflowX)&&n.scrollWidth>n.clientWidth){n.scrollLeft+=dx;return;}" +
+                "n=n.parentElement;}window.scrollBy(dx||0,d||0);})(" + x + "," + y + "," + (-cmd.Delta) + "," + cmd.DeltaX + ")";
+            await webView.CoreWebView2.ExecuteScriptAsync(script);
         }
 
         private async Task HandleSuspend()

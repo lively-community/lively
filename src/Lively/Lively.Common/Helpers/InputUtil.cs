@@ -1,4 +1,4 @@
-﻿using Lively.Common.Helpers.Pinvoke;
+using Lively.Common.Helpers.Pinvoke;
 using System;
 using System.Drawing;
 
@@ -28,6 +28,9 @@ namespace Lively.Common.Helpers
         public static void MouseMove(IntPtr hwnd, int x, int y) =>
             ForwardMessageMouse(hwnd, x, y, (int)NativeMethods.WM.MOUSEMOVE, MK_MOVE);
 
+        public static void MouseWheel(IntPtr hwnd, int x, int y, int delta) =>
+            ForwardMessageMouseWheel(hwnd, x, y, delta);
+
         /// <summary>
         /// Forward mouse input to the active/inactive window.
         /// </summary>
@@ -44,6 +47,25 @@ namespace Lively.Common.Helpers
             lParam <<= 16;
             lParam |= Convert.ToUInt32(x);
             NativeMethods.PostMessageW(hwnd, msg, wParam, (UIntPtr)lParam);
+        }
+
+        /// <summary>
+        /// Forward mouse wheel scroll to the active/inactive window.
+        /// </summary>
+        /// <param name="hwnd">Target window handle</param>
+        /// <param name="x">Cursor pos x (screen coordinates)</param>
+        /// <param name="y">Cursor pos y (screen coordinates)</param>
+        /// <param name="delta">Wheel delta, multiples of WHEEL_DELTA (120); positive = forward/away</param>
+        public static void ForwardMessageMouseWheel(IntPtr hwnd, int x, int y, int delta)
+        {
+            // The high-order word of wParam specifies the wheel delta, the low-order word the key flags;
+            // lParam specifies the position of the cursor in screen coordinates.
+            // Ref: https://docs.microsoft.com/en-us/windows/win32/inputdev/wm-mousewheel
+            IntPtr wParam = (IntPtr)(((delta & 0xFFFF) << 16) | 0);
+            // Pack as raw bits: screen coordinates can be negative on multi-monitor setups
+            // (displays left of/above the primary), which Convert.ToUInt32() would reject.
+            var lParam = (UIntPtr)(uint)((x & 0xFFFF) | (y << 16));
+            NativeMethods.PostMessageW(hwnd, (int)NativeMethods.WM.MOUSEWHEEL, wParam, lParam);
         }
 
         /// <summary>

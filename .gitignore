@@ -333,4 +333,7 @@ ASALocalRun/
 /src/Lively/Lively/Bundle/
 /src/Lively/Lively/Plugins/
 /src/Lively/Lively/Build/
-/src/Lively/Lively.UI.WinUI/Build/
+/src/Lively/Lively.UI.WinUI/Build/_debug/
+WheelInject.cs
+WheelInject.exe
+_publish_main/

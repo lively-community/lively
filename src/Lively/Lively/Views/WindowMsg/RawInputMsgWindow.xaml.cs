@@ -1,4 +1,4 @@
-﻿using Linearstar.Windows.RawInput;
+using Linearstar.Windows.RawInput;
 using Lively.Common.Helpers.Pinvoke;
 using Lively.Models.Enums;
 using System;
@@ -18,6 +18,7 @@ namespace Lively.Views.WindowMsg
         public event EventHandler<MouseRawArgs> MouseMoveRaw;
         public event EventHandler<MouseClickRawArgs> MouseDownRaw;
         public event EventHandler<MouseClickRawArgs> MouseUpRaw;
+        public event EventHandler<MouseWheelRawArgs> MouseWheelRaw;
         public event EventHandler<KeyboardClickRawArgs> KeyboardClickRaw;
 
         public RawInputMsgWindow()
@@ -42,7 +43,7 @@ namespace Lively.Views.WindowMsg
                     RawInputDevice.RegisterDevice(HidUsageAndPage.Mouse,
                         RawInputDeviceFlags.ExInputSink, hwnd);
                     break;
-                case InputForwardMode.mousekeyboard:
+                    case InputForwardMode.mousekeyboard:
                     RawInputDevice.RegisterDevice(HidUsageAndPage.Mouse,
                         RawInputDeviceFlags.ExInputSink, hwnd);
                     RawInputDevice.RegisterDevice(HidUsageAndPage.Keyboard,
@@ -50,8 +51,53 @@ namespace Lively.Views.WindowMsg
                     break;
             }
 
+            // Touchpad two-finger scroll never reaches the raw mouse stream while the
+            // desktop icon view owns the hover (it becomes WM_POINTERWHEEL, eaten by
+            // explorer); subscribe to the touchpad's PTP HID collection separately.
+            if (InputMode != InputForwardMode.off)
+                PtpWheel.Register(hwnd);
+
+            NLog.LogManager.GetCurrentClassLogger().Info($"RawInput registered: mode={InputMode} hwnd={hwnd}");
+
             HwndSource source = HwndSource.FromHwnd(hwnd);
             source.AddHook(Hook);
+        }
+
+        /// <summary>
+        /// Raw input delivery can stop after a session lock/unlock cycle
+        /// (secure desktop switch); re-registering on unlock restores it.
+        /// Registering an already-registered (usage, hwnd) pair is a silent
+        /// no-op for the OS, so remove first to force a route rebuild.
+        /// </summary>
+        public void ReRegisterRawInputDevices()
+        {
+            var windowInteropHelper = new WindowInteropHelper(this);
+            var hwnd = windowInteropHelper.Handle;
+
+            if (InputMode == InputForwardMode.off)
+                return;
+
+            var devices = InputMode == InputForwardMode.mousekeyboard
+                ? new[] { HidUsageAndPage.Mouse, HidUsageAndPage.Keyboard }
+                : new[] { HidUsageAndPage.Mouse };
+
+            foreach (var device in devices)
+            {
+                try
+                {
+                    RawInputDevice.UnregisterDevice(device);
+                }
+                catch (Exception)
+                {
+                    // Removing a stale/absent registration can fail; registering again below is what matters.
+                }
+            }
+            foreach (var device in devices)
+                RawInputDevice.RegisterDevice(device, RawInputDeviceFlags.ExInputSink, hwnd);
+
+            // The PTP subscription dies on the same secure-desktop switches; heal it too.
+            PtpWheel.Unregister(hwnd);
+            PtpWheel.Register(hwnd);
         }
 
         private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
@@ -68,6 +114,9 @@ namespace Lively.Views.WindowMsg
                     RawInputDevice.UnregisterDevice(HidUsageAndPage.Keyboard);
                     break;
             }
+
+            if (InputMode != InputForwardMode.off)
+                PtpWheel.Unregister(new WindowInteropHelper(this).Handle);
         }
 
         protected IntPtr Hook(IntPtr hwnd, int msg, IntPtr wparam, IntPtr lparam, ref bool handled)
@@ -75,6 +124,12 @@ namespace Lively.Views.WindowMsg
             // You can read inputs by processing the WM_INPUT message.
             if (msg == (int)NativeMethods.WM.INPUT)
             {
+                // PTP touchpad frames arrive as raw HID, which RawInput.Sharp does not
+                // decode; PtpWheel consumes any HID frame (raising wheel events for a
+                // two-finger scroll) and everything else falls through unchanged.
+                if (PtpWheel.TryProcessInput(lparam, this))
+                    return IntPtr.Zero;
+
                 // Create an RawInputData from the handle stored in lParam.
                 var data = RawInputData.FromHandle(lparam);
 
@@ -122,31 +177,17 @@ namespace Lively.Views.WindowMsg
                                 break;
                             case Linearstar.Windows.RawInput.Native.RawMouseButtonFlags.MouseWheel:
                                 {
-                                    //Disabled, not tested yet.
-                                    /*
-                                    https://github.com/ivarboms/game-engine/blob/master/Input/RawInput.cpp
-                                    Mouse wheel deltas are represented as multiples of 120.
-                                    MSDN: The delta was set to 120 to allow Microsoft or other vendors to build
-                                    finer-resolution wheels (a freely-rotating wheel with no notches) to send more
-                                    messages per rotation, but with a smaller value in each message.
-                                    Because of this, the value is converted to a float in case a mouse's wheel
-                                    reports a value other than 120, in which case dividing by 120 would produce
-                                    a very incorrect value.
-                                    More info: http://social.msdn.microsoft.com/forums/en-US/gametechnologiesgeneral/thread/1deb5f7e-95ee-40ac-84db-58d636f601c7/
-                                    */
-
-                                    /*
-                                    // One wheel notch is represented as this delta (WHEEL_DELTA).
-                                    const float oneNotch = 120;
-
-                                    // Mouse wheel delta in multiples of WHEEL_DELTA (120).
-                                    float mouseWheelDelta = mouse.Mouse.RawButtons;
-
-                                    // Convert each notch from [-120, 120] to [-1, 1].
-                                    mouseWheelDelta = mouseWheelDelta / oneNotch;
-
-                                    MouseScrollSimulate(mouseWheelDelta);
-                                    */
+                                    // Mouse wheel deltas are multiples of WHEEL_DELTA (120);
+                                    // the signed delta is carried in usButtonData (ButtonData property).
+                                    // RawButtons maps to ulRawButtons (raw device bits, usually 0) and is NOT the delta.
+                                    // Ref: https://docs.microsoft.com/en-us/windows/win32/inputdev/raw-input
+                                    MouseWheelRaw?.Invoke(this, new MouseWheelRawArgs(P.X, P.Y, mouse.Mouse.ButtonData));
+                                }
+                                break;
+                            case Linearstar.Windows.RawInput.Native.RawMouseButtonFlags.MouseHorizontalWheel:
+                                {
+                                    // Horizontal wheel (touchpad side-swipe): same usButtonData payload.
+                                    MouseWheelRaw?.Invoke(this, new MouseWheelRawArgs(P.X, P.Y, mouse.Mouse.ButtonData, horizontal: true));
                                 }
                                 break;
                         }
@@ -163,6 +204,15 @@ namespace Lively.Views.WindowMsg
                 }
             }
             return IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Raise a wheel event from the PTP two-finger gesture; identical to a physical
+        /// wheel downstream (hover gate + player IPC).
+        /// </summary>
+        internal void RaisePtpWheel(int x, int y, int delta)
+        {
+            MouseWheelRaw?.Invoke(this, new MouseWheelRawArgs(x, y, delta));
         }
     }
 
@@ -189,6 +239,25 @@ namespace Lively.Views.WindowMsg
         public MouseClickRawArgs(int x, int y, RawInputMouseBtn btn) : base(x, y)
         {
             Button = btn;
+        }
+    }
+
+    public class MouseWheelRawArgs : MouseRawArgs
+    {
+        /// <summary>
+        /// Wheel delta, multiples of WHEEL_DELTA (120); positive = forward/away (or right when Horizontal).
+        /// </summary>
+        public int Delta { get; }
+
+        /// <summary>
+        /// true when the gesture is a horizontal wheel (touchpad side-swipe).
+        /// </summary>
+        public bool Horizontal { get; }
+
+        public MouseWheelRawArgs(int x, int y, int delta, bool horizontal = false) : base(x, y)
+        {
+            Delta = delta;
+            Horizontal = horizontal;
         }
     }
 

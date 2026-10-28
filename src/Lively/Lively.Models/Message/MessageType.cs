@@ -22,5 +22,7 @@
         lp_cpicker,
         lp_chekbox,
         lp_dropdown_scaler,
+        // Append new values only: existing players (VLC etc.) deserialize by numeric value.
+        cmd_wheel,
     }
 }
