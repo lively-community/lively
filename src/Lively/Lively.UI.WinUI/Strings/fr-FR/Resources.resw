@@ -837,7 +837,7 @@ Edge est la vue Web intégrée de Windows 10.</value>
   </data>
   <data name="Store.Header" xml:space="preserve">
     <value>Magasin</value>
-    <comment>For different version of Lively, example: Microsoft Store</comment>
+    <comment>Pour différentes versions de Lively, exemple : Microsoft Store</comment>
   </data>
   <data name="StreamWallpaperVideoQuality.Header" xml:space="preserve">
     <value>Flux</value>
